@@ -1047,7 +1047,7 @@ contract BettingCore is Ownable, ReentrancyGuard, Pausable {
         require(depositIndex < deposits.length, "Invalid deposit index");
         DataTypes.LPDeposit storage dep = deposits[depositIndex];
         require(dep.active, "Deposit already withdrawn");
-        require(block.timestamp < dep.lockExpiry, "Lock expired — use withdrawLiquidity");
+        require(block.timestamp < dep.lockExpiry, "Lock expired: use withdrawLiquidity");
 
         uint256 fullAmount = _lpShareValue(dep.shares, s);
         require(fullAmount <= s.lpReserves, "Insufficient LP reserves");
