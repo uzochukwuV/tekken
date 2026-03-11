@@ -532,11 +532,13 @@ contract GameCore is VRFConsumerBaseV2Plus {
     /**
      * @notice Set round duration
      * @param _duration New round duration in seconds
-     * @dev Duration must be between 1 hour and 7 days for safety
+     * @dev Duration must be between 1 hour and 48 hours.
+     *      Matches are single-game markets that overlap; keeping the max at 48h
+     *      ensures round pools settle well within any LP's minimum 1-day lock window.
      */
     function setRoundDuration(uint256 _duration) external onlyOwner {
-        require(_duration >= 1 hours, "Duration too short");
-        require(_duration <= 7 days, "Duration too long");
+        require(_duration >= 1 hours,  "Duration too short");
+        require(_duration <= 48 hours, "Duration too long (max 48h)");
         roundDuration = _duration;
         emit RoundDurationUpdated(_duration);
     }

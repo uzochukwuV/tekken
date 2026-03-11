@@ -126,21 +126,35 @@ library DataTypes {
 
     // ============ LP Pool Structs ============
 
-    /// @notice LP position data
-    struct LPPosition {
-        uint128 shares;             // LP shares owned
-        uint128 totalDeposited;     // Cumulative deposits
-        uint128 totalWithdrawn;     // Cumulative withdrawals
-        uint64 lastDepositTime;     // For time-based features
+    /// @notice Individual LP deposit with a per-deposit time-lock
+    /// @dev Each call to depositLiquidity() creates one LPDeposit entry.
+    ///      LP holds multiple positions and can exit each independently after lockExpiry.
+    ///      Early exit burns the position but charges a fee that stays in the pool,
+    ///      benefiting remaining LPs (like a penalty for breaking a perp position early).
+    struct LPDeposit {
+        uint128 shares;          // LP shares minted — larger for longer lock tiers
+        uint128 amount;          // Original LBT deposited
+        uint64  depositTime;     // Block timestamp of deposit
+        uint64  lockExpiry;      // depositTime + lockDuration; free exit after this
+        uint8   lockTierIndex;   // 0=1d | 1=3d | 2=7d | 3=14d | 4=30d
+        bool    active;          // False once withdrawn (never deleted — index stays stable)
     }
 
-    /// @notice Pool state for a single token
+    /// @notice Legacy pool state (kept for ABI compatibility, not used in LP v2)
     struct PoolState {
-        uint128 totalLiquidity;     // Total tokens in pool
-        uint128 totalShares;        // Total LP shares issued
-        uint128 lockedLiquidity;    // Locked for active bets
-        uint128 borrowedForBalancing;// Lent to betting pools
-        bool roundActive;           // Deposits/withdrawals blocked
+        uint128 totalLiquidity;
+        uint128 totalShares;
+        uint128 lockedLiquidity;
+        uint128 borrowedForBalancing;
+        bool roundActive;
+    }
+
+    /// @notice Legacy LP position (kept for ABI compatibility, not used in LP v2)
+    struct LPPosition {
+        uint128 shares;
+        uint128 totalDeposited;
+        uint128 totalWithdrawn;
+        uint64 lastDepositTime;
     }
 
     // ============ Params Structs (Stack-too-deep prevention) ============

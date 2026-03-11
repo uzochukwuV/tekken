@@ -129,6 +129,26 @@ library BettingStorage {
         /// @notice Default seed amounts per outcome
         DataTypes.SeedConfig defaultSeeds;
 
+        // ============ LP System (v2 — global pool with per-deposit time-locks) ============
+
+        /// @notice Free LP capital available to back new bets
+        /// @dev Separate from protocolReserves. Grows/shrinks with deposits, withdrawals,
+        ///      and pro-rata share of round sweep profits/losses.
+        uint256 lpReserves;
+
+        /// @notice Total LP share tokens outstanding (across all active deposits)
+        uint256 totalLPShares;
+
+        /// @notice All LP deposit positions, keyed by LP address
+        /// @dev Array never shrinks — inactive positions have active=false.
+        ///      depositIndex is the array index, stable forever.
+        mapping(address => DataTypes.LPDeposit[]) lpDeposits;
+
+        /// @notice LP fraction of the combined pool at the time each round was seeded (1e18 scale)
+        /// @dev Snapshotted in seedRound(). Used at sweepRoundPool() to split
+        ///      the remaining pot between LP reserves and protocol reserves proportionally.
+        mapping(uint256 => uint256) lpFractionAtSeed;
+
         // ============ Flags ============
 
         /// @notice Emergency pause flag

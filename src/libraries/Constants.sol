@@ -98,6 +98,32 @@ library Constants {
 
     uint256 constant MINIMUM_LIQUIDITY = 1000; // Locked forever on first deposit
 
+    // ============ LP Lock Tiers ============
+    // Per-deposit time-locks with bonus share multipliers ("perp long" model)
+
+    uint256 constant LP_MIN_DEPOSIT      = 100 ether;  // 100 LBT minimum per deposit
+    uint256 constant LP_EARLY_EXIT_FEE_BPS = 1000;     // 10% penalty — stays in pool for remaining LPs
+    uint256 constant MINIMUM_LP_SHARES   = 1000;        // Permanently locked on first deposit (inflation guard)
+
+    // Lock durations
+    uint256 constant LP_LOCK_1D  = 1 days;
+    uint256 constant LP_LOCK_3D  = 3 days;
+    uint256 constant LP_LOCK_7D  = 7 days;
+    uint256 constant LP_LOCK_14D = 14 days;
+    uint256 constant LP_LOCK_30D = 30 days;
+
+    // Share multipliers per tier (BPS — 10000 = 1.00x baseline)
+    // Longer lock → more shares minted per LBT → bigger slice of pool profits
+    uint256 constant LP_MULT_1D  = 10000;  // 1.00x
+    uint256 constant LP_MULT_3D  = 10500;  // 1.05x
+    uint256 constant LP_MULT_7D  = 11000;  // 1.10x
+    uint256 constant LP_MULT_14D = 11500;  // 1.15x
+    uint256 constant LP_MULT_30D = 12500;  // 1.25x
+
+    // ============ Match Duration ============
+
+    uint256 constant MAX_ROUND_DURATION = 48 hours; // Maximum single-match duration
+
     // ============ Bounty System ============
 
     uint256 constant MIN_BOUNTY_CLAIM = 50 ether;  // Minimum payout for bounty claims (50 LBT)

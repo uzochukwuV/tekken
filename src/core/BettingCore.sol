@@ -229,18 +229,23 @@ contract BettingCore is Ownable, ReentrancyGuard, Pausable {
         // Calculate potential payout using final multiplier
         uint256 potentialPayout = (amount * finalMultiplier) / Constants.PRECISION;
 
-        // NEW ACCOUNTING: Check protocol has enough reserves to lock for this bet
-        require(s.protocolReserves >= potentialPayout, "Insufficient protocol reserves");
+        // Check combined pool (protocol reserves + LP reserves) can cover the locked payout
+        uint256 totalPool = s.protocolReserves + s.lpReserves;
+        require(totalPool >= potentialPayout, "Insufficient pool liquidity");
 
         // Transfer LBT from user to contract
         IERC20(s.lbtToken).safeTransferFrom(msg.sender, address(this), amount);
 
-        // NEW ACCOUNTING: Move funds according to round pool model
-        // 1. Add bet amount to protocol reserves (available for future rounds)
+        // 1. Add bet amount to protocol reserves (bets always credited to protocol side)
         s.protocolReserves += amount;
 
-        // 2. Lock potential payout: Protocol reserves → Round pool
-        s.protocolReserves -= potentialPayout;
+        // 2. Lock potential payout — draw from protocol and LP proportionally to their
+        //    current share of the combined pool.  The lpFractionAtSeed snapshotted in
+        //    seedRound() governs how the pot is returned at sweep time; here we use the
+        //    live ratio so each bet fairly draws from whoever has capital available.
+        uint256 lpDraw = totalPool > 0 ? (potentialPayout * s.lpReserves) / totalPool : 0;
+        s.lpReserves     -= lpDraw;
+        s.protocolReserves -= (potentialPayout - lpDraw);
         s.roundPools[roundId].totalLocked += potentialPayout;
 
         // Create bet
@@ -321,12 +326,18 @@ contract BettingCore is Ownable, ReentrancyGuard, Pausable {
             acct.totalBets--;
         }
 
-        // NEW ACCOUNTING: Return locked funds from round pool → protocol reserves
+        // Return locked payout from round pool → back to protocol and LP proportionally.
+        // Use the LP fraction snapshotted when this round was seeded so the return
+        // mirrors how the funds were originally drawn at bet placement.
         DataTypes.RoundPool storage pool = s.roundPools[bet.roundId];
         pool.totalLocked -= bet.potentialPayout;
-        s.protocolReserves += bet.potentialPayout;
 
-        // Remove bet amount from protocol reserves (it's being refunded)
+        uint256 lpFrac  = s.lpFractionAtSeed[bet.roundId];
+        uint256 lpReturn = (uint256(bet.potentialPayout) * lpFrac) / 1e18;
+        s.lpReserves       += lpReturn;
+        s.protocolReserves += uint256(bet.potentialPayout) - lpReturn;
+
+        // Remove bet amount from protocol reserves (it's being refunded to user)
         s.protocolReserves -= bet.amount;
 
         // Transfer refund to user
@@ -609,9 +620,17 @@ contract BettingCore is Ownable, ReentrancyGuard, Pausable {
         meta.roundStartTime = uint64(block.timestamp);
         meta.roundEndTime = uint64(block.timestamp + Constants.ROUND_DURATION);
 
-        // NEW ACCOUNTING: Initialize round pool sweep deadline
+        // Initialize round pool sweep deadline
         // Sweep deadline = roundEndTime + 24h claim window + 6h grace period = 30h total
         s.roundPools[roundId].sweepDeadline = uint64(block.timestamp + Constants.ROUND_DURATION + Constants.CLAIM_DEADLINE + Constants.SWEEP_GRACE_PERIOD);
+
+        // Snapshot LP fraction of combined pool at seed time.
+        // This ratio is used at sweepRoundPool() to split unclaimed/losing-bet profits
+        // back to LP reserves and protocol reserves proportionally.
+        uint256 combinedPool = s.protocolReserves + s.lpReserves;
+        s.lpFractionAtSeed[roundId] = combinedPool > 0
+            ? (s.lpReserves * 1e18) / combinedPool
+            : 0;
 
         s.currentRoundId = roundId;
 
@@ -680,41 +699,45 @@ contract BettingCore is Ownable, ReentrancyGuard, Pausable {
         pool.swept = true;
 
         if (remaining > 0) {
-            // MOVE: Round pool → Protocol reserves
-            s.protocolReserves += remaining;
-
-            // DISTRIBUTE: 2% to season pool, 98% stays in protocol reserves
+            // Take 2% season fee from the total remaining before splitting
             uint256 seasonShare = 0;
-            uint256 protocolShare = remaining;
+            uint256 afterFee = remaining;
 
             if (s.seasonPredictor != address(0)) {
-                seasonShare = (remaining * Constants.SEASON_POOL_FEE_BPS) / Constants.BPS_PRECISION; // 2%
-                protocolShare = remaining - seasonShare;
-
-                // Move season share from protocol reserves to season predictor
-                if (seasonShare > 0) {
-                    s.protocolReserves -= seasonShare;
-                    IERC20(s.lbtToken).safeTransfer(s.seasonPredictor, seasonShare);
-
-                    // Get current season ID from GameEngine
-                    (bool success, bytes memory data) = s.gameEngine.staticcall(
-                        abi.encodeWithSignature("getCurrentSeason()")
-                    );
-                    require(success, "Failed to get season ID");
-                    uint256 seasonId = abi.decode(data, (uint256));
-
-                    // Fund the season pool
-                    (success, ) = s.seasonPredictor.call(
-                        abi.encodeWithSignature("fundSeasonPool(uint256,uint256)", seasonId, seasonShare)
-                    );
-                    require(success, "Failed to fund season pool");
-                }
+                seasonShare = (remaining * Constants.SEASON_POOL_FEE_BPS) / Constants.BPS_PRECISION;
+                afterFee = remaining - seasonShare;
             }
 
-            // Track protocol profit
-            s.totalProtocolFees += protocolShare;
+            // Split afterFee between LP reserves and protocol reserves using the
+            // fraction snapshotted when this round was seeded.
+            uint256 lpFrac      = s.lpFractionAtSeed[roundId];
+            uint256 lpProfit    = (afterFee * lpFrac) / 1e18;
+            uint256 protocolProfit = afterFee - lpProfit;
 
-            emit RoundPoolSwept(roundId, remaining, protocolShare, seasonShare);
+            s.lpReserves       += lpProfit;
+            s.protocolReserves += protocolProfit;
+
+            // Distribute season share
+            if (seasonShare > 0 && s.seasonPredictor != address(0)) {
+                // Get current season ID from GameEngine
+                (bool success, bytes memory data) = s.gameEngine.staticcall(
+                    abi.encodeWithSignature("getCurrentSeason()")
+                );
+                require(success, "Failed to get season ID");
+                uint256 seasonId = abi.decode(data, (uint256));
+
+                IERC20(s.lbtToken).safeTransfer(s.seasonPredictor, seasonShare);
+
+                (success, ) = s.seasonPredictor.call(
+                    abi.encodeWithSignature("fundSeasonPool(uint256,uint256)", seasonId, seasonShare)
+                );
+                require(success, "Failed to fund season pool");
+            }
+
+            // Track protocol profit (excluding LP share)
+            s.totalProtocolFees += protocolProfit;
+
+            emit RoundPoolSwept(roundId, remaining, protocolProfit, seasonShare);
         } else {
             emit RoundPoolSwept(roundId, 0, 0, 0);
         }
@@ -881,32 +904,248 @@ contract BettingCore is Ownable, ReentrancyGuard, Pausable {
 
     /**
      * @notice Get available reserves (not locked for active bets)
-     * @return available Amount that can be withdrawn (protocol reserves)
-     * @return locked Amount locked in round pools for payouts
-     * @return total Total contract balance
+     * @return available Protocol reserves (not locked to any round)
+     * @return lpFree    LP reserves (free, not locked to any round)
+     * @return locked    Amount locked in the current round pool
+     * @return total     Total contract LBT balance
      */
     function getAvailableReserves() external view returns (
         uint256 available,
+        uint256 lpFree,
         uint256 locked,
         uint256 total
     ) {
         BettingStorage.Layout storage s = BettingStorage.layout();
 
-        // NEW ACCOUNTING:
-        // - available = protocolReserves (not locked to any round)
-        // - locked = sum of all active round pools
-        // - total = contract balance
-
         available = s.protocolReserves;
-        total = IERC20(s.lbtToken).balanceOf(address(this));
+        lpFree    = s.lpReserves;
+        total     = IERC20(s.lbtToken).balanceOf(address(this));
 
-        // Calculate locked in current round pool
         if (s.currentRoundId > 0) {
             DataTypes.RoundPool storage pool = s.roundPools[s.currentRoundId];
             if (!pool.swept) {
                 locked = pool.totalLocked - pool.totalClaimed;
             }
         }
+    }
+
+    // ============ LP System (v2) ============
+
+    event LiquidityDeposited(
+        address indexed lp,
+        uint256 amount,
+        uint256 shares,
+        uint8   lockTierIndex,
+        uint64  lockExpiry
+    );
+    event LiquidityWithdrawn(
+        address indexed lp,
+        uint256 depositIndex,
+        uint256 amount,
+        uint256 sharesBurned
+    );
+    event LiquidityEarlyExit(
+        address indexed lp,
+        uint256 depositIndex,
+        uint256 amountOut,
+        uint256 penaltyKept   // stays in LP pool, benefits remaining LPs
+    );
+
+    /**
+     * @notice Deposit LBT as LP liquidity and receive time-locked shares
+     * @param amount         LBT amount to deposit (>= LP_MIN_DEPOSIT)
+     * @param lockTierIndex  0=1d | 1=3d | 2=7d | 3=14d | 4=30d
+     * @dev  Longer lock → higher share multiplier → bigger pro-rata claim on pool profits.
+     *       Share price = lpReserves / totalLPShares.  LP effectively opens a "perp long"
+     *       on the house edge: profitable when bettors lose, risky when they win.
+     */
+    function depositLiquidity(
+        uint256 amount,
+        uint8   lockTierIndex
+    ) external nonReentrant whenNotPaused {
+        require(amount >= Constants.LP_MIN_DEPOSIT, "Below LP minimum deposit");
+        require(lockTierIndex <= 4, "Invalid lock tier (0-4)");
+
+        BettingStorage.Layout storage s = BettingStorage.layout();
+        require(s.lbtToken != address(0), "LBT token not set");
+
+        IERC20(s.lbtToken).safeTransferFrom(msg.sender, address(this), amount);
+
+        uint256 multiplierBps = _lpLockMultiplier(lockTierIndex);
+        uint256 lockDuration  = _lpLockDuration(lockTierIndex);
+        uint256 sharesToMint;
+
+        if (s.totalLPShares == 0) {
+            // Bootstrap: 1 LBT = 1 share at multiplier, minus permanently locked minimum
+            // (standard Uniswap v2 dead-share pattern prevents price manipulation)
+            sharesToMint = (amount * multiplierBps / Constants.BPS_PRECISION) - Constants.MINIMUM_LP_SHARES;
+            s.totalLPShares += Constants.MINIMUM_LP_SHARES; // burned forever
+        } else {
+            // Proportional: sharesToMint = amount * totalShares * multiplier / (lpReserves * BPS)
+            sharesToMint = (amount * s.totalLPShares * multiplierBps)
+                           / (s.lpReserves * Constants.BPS_PRECISION);
+        }
+
+        require(sharesToMint > 0, "Zero shares minted");
+
+        uint64 lockExpiry = uint64(block.timestamp + lockDuration);
+
+        s.lpDeposits[msg.sender].push(DataTypes.LPDeposit({
+            shares:        uint128(sharesToMint),
+            amount:        uint128(amount),
+            depositTime:   uint64(block.timestamp),
+            lockExpiry:    lockExpiry,
+            lockTierIndex: lockTierIndex,
+            active:        true
+        }));
+
+        s.totalLPShares += sharesToMint;
+        s.lpReserves    += amount;
+
+        emit LiquidityDeposited(msg.sender, amount, sharesToMint, lockTierIndex, lockExpiry);
+    }
+
+    /**
+     * @notice Withdraw a fully-unlocked LP deposit (no penalty)
+     * @param depositIndex  Index in msg.sender's lpDeposits array
+     * @dev  Withdrawable amount = shares * lpReserves / totalLPShares.
+     *       If pool grew (protocol profitable), LP receives more than deposited.
+     *       If pool shrank (bettors won), LP receives less.
+     */
+    function withdrawLiquidity(uint256 depositIndex) external nonReentrant {
+        BettingStorage.Layout storage s = BettingStorage.layout();
+        DataTypes.LPDeposit[] storage deposits = s.lpDeposits[msg.sender];
+
+        require(depositIndex < deposits.length, "Invalid deposit index");
+        DataTypes.LPDeposit storage dep = deposits[depositIndex];
+        require(dep.active, "Deposit already withdrawn");
+        require(block.timestamp >= dep.lockExpiry, "Lock period not expired");
+
+        uint256 withdrawAmount = _lpShareValue(dep.shares, s);
+        require(withdrawAmount <= s.lpReserves, "Insufficient LP reserves");
+
+        dep.active = false;
+        s.totalLPShares -= dep.shares;
+        s.lpReserves    -= withdrawAmount;
+
+        IERC20(s.lbtToken).safeTransfer(msg.sender, withdrawAmount);
+
+        emit LiquidityWithdrawn(msg.sender, depositIndex, withdrawAmount, dep.shares);
+    }
+
+    /**
+     * @notice Exit an LP deposit before its lock expires (10% penalty)
+     * @param depositIndex  Index in msg.sender's lpDeposits array
+     * @dev  10% of the current share value is kept in the LP pool, immediately
+     *       increasing the share price for all remaining LPs.
+     *       Use withdrawLiquidity() after lockExpiry for a penalty-free exit.
+     */
+    function earlyExitLiquidity(uint256 depositIndex) external nonReentrant {
+        BettingStorage.Layout storage s = BettingStorage.layout();
+        DataTypes.LPDeposit[] storage deposits = s.lpDeposits[msg.sender];
+
+        require(depositIndex < deposits.length, "Invalid deposit index");
+        DataTypes.LPDeposit storage dep = deposits[depositIndex];
+        require(dep.active, "Deposit already withdrawn");
+        require(block.timestamp < dep.lockExpiry, "Lock expired — use withdrawLiquidity");
+
+        uint256 fullAmount = _lpShareValue(dep.shares, s);
+        require(fullAmount <= s.lpReserves, "Insufficient LP reserves");
+
+        uint256 penalty    = (fullAmount * Constants.LP_EARLY_EXIT_FEE_BPS) / Constants.BPS_PRECISION;
+        uint256 amountOut  = fullAmount - penalty;
+
+        // Burn the shares and remove only the net payout from lpReserves.
+        // The penalty (fullAmount - amountOut) stays in the pool, boosting share price
+        // for remaining LPs — equivalent to a liquidation penalty in a perp market.
+        dep.active = false;
+        s.totalLPShares -= dep.shares;
+        s.lpReserves    -= amountOut; // penalty remains in lpReserves
+
+        IERC20(s.lbtToken).safeTransfer(msg.sender, amountOut);
+
+        emit LiquidityEarlyExit(msg.sender, depositIndex, amountOut, penalty);
+    }
+
+    // ============ LP View Functions ============
+
+    /**
+     * @notice Current LP share price: how much 1 share is worth in LBT (1e18 scale)
+     */
+    function getLPSharePrice() external view returns (uint256) {
+        BettingStorage.Layout storage s = BettingStorage.layout();
+        if (s.totalLPShares == 0) return 1e18;
+        return (s.lpReserves * 1e18) / s.totalLPShares;
+    }
+
+    /**
+     * @notice All LP deposit positions for an address (active and inactive)
+     */
+    function getLPDeposits(address lp) external view returns (DataTypes.LPDeposit[] memory) {
+        return BettingStorage.layout().lpDeposits[lp];
+    }
+
+    /**
+     * @notice Current LBT value and total shares of all active deposits for an LP
+     */
+    function getLPValue(address lp) external view returns (uint256 totalValue, uint256 totalShares) {
+        BettingStorage.Layout storage s = BettingStorage.layout();
+        DataTypes.LPDeposit[] storage deposits = s.lpDeposits[lp];
+        for (uint256 i = 0; i < deposits.length; i++) {
+            if (deposits[i].active) {
+                totalShares += deposits[i].shares;
+            }
+        }
+        if (s.totalLPShares > 0 && totalShares > 0) {
+            totalValue = (totalShares * s.lpReserves) / s.totalLPShares;
+        }
+    }
+
+    /**
+     * @notice Free LP reserves (not locked in any active round pool)
+     */
+    function getLPReserves() external view returns (uint256) {
+        return BettingStorage.layout().lpReserves;
+    }
+
+    /**
+     * @notice Total LP shares outstanding
+     */
+    function getTotalLPShares() external view returns (uint256) {
+        return BettingStorage.layout().totalLPShares;
+    }
+
+    /**
+     * @notice LP fraction snapshotted for a round (1e18 scale)
+     */
+    function getLPFractionAtSeed(uint256 roundId) external view returns (uint256) {
+        return BettingStorage.layout().lpFractionAtSeed[roundId];
+    }
+
+    // ============ LP Internal Helpers ============
+
+    function _lpShareValue(
+        uint256 shares,
+        BettingStorage.Layout storage s
+    ) internal view returns (uint256) {
+        if (s.totalLPShares == 0) return 0;
+        return (shares * s.lpReserves) / s.totalLPShares;
+    }
+
+    function _lpLockMultiplier(uint8 tierIndex) internal pure returns (uint256) {
+        if (tierIndex == 0) return Constants.LP_MULT_1D;
+        if (tierIndex == 1) return Constants.LP_MULT_3D;
+        if (tierIndex == 2) return Constants.LP_MULT_7D;
+        if (tierIndex == 3) return Constants.LP_MULT_14D;
+        return Constants.LP_MULT_30D;
+    }
+
+    function _lpLockDuration(uint8 tierIndex) internal pure returns (uint256) {
+        if (tierIndex == 0) return Constants.LP_LOCK_1D;
+        if (tierIndex == 1) return Constants.LP_LOCK_3D;
+        if (tierIndex == 2) return Constants.LP_LOCK_7D;
+        if (tierIndex == 3) return Constants.LP_LOCK_14D;
+        return Constants.LP_LOCK_30D;
     }
 
     // ============ Emergency ============
